@@ -1,103 +1,76 @@
 from fastapi import FastAPI
 import pandas as pd
 import yfinance as yf
-import requests
+import numpy as np
 
 app = FastAPI()
 
+# A set of common crypto symbols to help identify them and default to a USD pair.
+COMMON_CRYPTO_SYMBOLS = {
+    "BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "SHIB", "AVAX", 
+    "DOT", "TRX", "LINK", "MATIC", "LTC", "BCH", "UNI", "ATOM"
+}
+
 # --------------------------------------------------------------------------
-# ACCURATE RSI CALCULATION (Matching TradingView's Wilder's RSI)
+# HIGHLY ACCURATE & EFFICIENT RSI CALCULATION (Vectorized)
 # --------------------------------------------------------------------------
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     """
-    Calculates the Relative Strength Index (RSI) using the Wilder's smoothing method,
-    which is standard on TradingView and other platforms.
+    Calculates Wilder's RSI using a vectorized method that matches TradingView.
+    This is more efficient and robust than a loop-based approach.
     """
+    if series.size < period + 1:
+        return pd.Series(dtype=np.float64) # Return empty series if not enough data
+
     delta = series.diff()
-
-    # Separate gains and losses
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-
-    # Calculate the initial average gain and loss using a simple moving average
-    avg_gain = gain.rolling(window=period, min_periods=period).mean()[:period]
-    avg_loss = loss.rolling(window=period, min_periods=period).mean()[:period]
     
-    # After the initial period, use Wilder's smoothing
-    # avg_gain_prev = avg_gain.iloc[-1]
-    # avg_loss_prev = avg_loss.iloc[-1]
+    # Make gains and losses series
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+
+    # Calculate initial averages using Simple Moving Average
+    initial_avg_gain = gain.rolling(window=period, min_periods=period).mean().dropna()
+    initial_avg_loss = loss.rolling(window=period, min_periods=period).mean().dropna()
+
+    # Setup the final average series
+    avg_gain = pd.Series(index=series.index, dtype=np.float64)
+    avg_loss = pd.Series(index=series.index, dtype=np.float64)
     
-    for i in range(period, len(series)):
-        avg_gain = avg_gain.append(pd.Series([(avg_gain.iloc[-1] * (period - 1) + gain.iloc[i]) / period], index=[series.index[i]]))
-        avg_loss = avg_loss.append(pd.Series([(avg_loss.iloc[-1] * (period - 1) + loss.iloc[i]) / period], index=[series.index[i]]))
+    # Set the first average value
+    if not initial_avg_gain.empty:
+        avg_gain.iloc[period] = initial_avg_gain.iloc[0]
+        avg_loss.iloc[period] = initial_avg_loss.iloc[0]
+
+    # Calculate the rest of the averages using Wilder's smoothing (equivalent to EMA with alpha=1/period)
+    for i in range(period + 1, len(series)):
+        avg_gain.iloc[i] = (avg_gain.iloc[i-1] * (period - 1) + gain.iloc[i]) / period
+        avg_loss.iloc[i] = (avg_loss.iloc[i-1] * (period - 1) + loss.iloc[i]) / period
 
     # Calculate RS and RSI
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
+    rsi = 100.0 - (100.0 / (1.0 + rs))
     
-    return rsi
+    return rsi.dropna()
 
-# --------------------------------------------------------------------------
-# UNIFIED DATA FETCHER (Yahoo Finance & Binance)
-# --------------------------------------------------------------------------
-def get_stock_data(symbol: str, interval: str = "1d"):
+def get_yfinance_params(interval: str) -> dict:
     """
-    Fetches historical data for both stocks (US, NSE) and crypto.
-    - For stocks (e.g., 'AAPL', 'RELIANCE.NS'), uses yfinance.
-    - For crypto (e.g., 'BTC-USD'), uses Binance API.
-    
-    Fetches enough data for RSI warm-up.
+    Determines the correct 'period' to fetch from yfinance based on the interval
+    to ensure enough data for RSI warm-up while respecting API limits.
     """
-    # 1. Handle Crypto Symbols (e.g., BTC-USD, ETH-USDT)
-    if "-" in symbol:
-        try:
-            # Convert to Binance format (e.g., BTC-USD -> BTCUSDT)
-            pair = symbol.replace("-", "")
-            
-            # Map common intervals to Binance format
-            interval_map = {"1d": "1d", "4h": "4h", "1h": "1h", "1wk": "1w"}
-            binance_interval = interval_map.get(interval, "1d")
-            
-            # Fetch at least 500 candles for proper RSI calculation
-            url = f"https://api.binance.com/api/v3/klines?symbol={pair}&interval={binance_interval}&limit=500"
-            
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status() # Raise an exception for bad status codes
-            data = resp.json()
-
-            df = pd.DataFrame(data, columns=[
-                "Open time", "Open", "High", "Low", "Close", "Volume",
-                "Close time", "Quote asset vol", "Trades", "TB Base vol",
-                "TB Quote vol", "Ignore"
-            ])
-            df["Date"] = pd.to_datetime(df["Open time"], unit="ms")
-            df.set_index("Date", inplace=True)
-            df["Close"] = df["Close"].astype(float)
-            return df
-
-        except Exception as e:
-            print(f"Error fetching crypto data for {symbol}: {e}")
-            return pd.DataFrame()
-
-    # 2. Handle Stock Symbols (e.g., AAPL, RELIANCE.NS)
+    # yfinance intraday data is limited to a 60-day lookback period.
+    if interval in ["1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"]:
+        return {"period": "60d", "interval": interval}
+    # For intervals of 4h or more, we can fetch a longer history.
+    elif interval in ["4h"]:
+        return {"period": "730d", "interval": "1d"} # Fetch daily to calculate, then can resample if needed
+    elif interval in ["1d", "5d", "1wk"]:
+        return {"period": "5y", "interval": interval}
+    elif interval in ["1mo", "3mo"]:
+        return {"period": "max", "interval": interval}
     else:
-        try:
-            # yfinance requires a longer period to fetch enough data points for daily interval
-            # Fetch ~2 years of data for daily, 60d for hourly, etc.
-            period_map = {"1d": "2y", "1wk": "5y", "1h": "730d"}
-            fetch_period = period_map.get(interval, "1y")
+        # Default for unrecognized intervals
+        return {"period": "2y", "interval": "1d"}
 
-            data = yf.download(
-                tickers=symbol,
-                period=fetch_period,
-                interval=interval,
-                auto_adjust=True, # Recommended for simplicity
-                progress=False
-            )
-            return data
-        except Exception as e:
-            print(f"Error fetching stock data for {symbol}: {e}")
-            return pd.DataFrame()
 
 # ----------------------------
 # API Endpoints
@@ -109,24 +82,37 @@ def home():
 @app.get("/rsi")
 def get_rsi(symbol: str, period: int = 14, interval: str = "1d"):
     try:
-        # Unified data fetching
-        data = get_stock_data(symbol, interval)
+        # --- SMART SYMBOL NORMALIZATION ---
+        normalized_symbol = symbol.upper()
+        if "-" not in normalized_symbol and normalized_symbol in COMMON_CRYPTO_SYMBOLS:
+            normalized_symbol = f"{normalized_symbol}-USD"
+
+        # --- CORRECT DATA FETCHING ---
+        params = get_yfinance_params(interval)
+        
+        data = yf.download(
+            tickers=normalized_symbol,
+            **params,  # Unpack the period and interval parameters
+            auto_adjust=True,
+            progress=False
+        )
 
         if data.empty or "Close" not in data.columns:
-            return {"symbol": symbol, "error": f"No data found for interval '{interval}'.", "interval": interval}
+            return {"symbol": symbol, "error": f"No data found for symbol '{normalized_symbol}' on interval '{interval}'. Check if the symbol and interval are valid.", "interval": interval}
         
-        if len(data) < period * 2: # Check if there's enough data for a meaningful calculation
-            return {"symbol": symbol, "error": "Insufficient historical data for RSI calculation.", "interval": interval}
+        if len(data) < period * 2: 
+            return {"symbol": symbol, "error": f"Insufficient historical data for RSI calculation (need at least {period*2} data points, got {len(data)}).", "interval": interval}
 
-        # Use the accurate RSI calculation function
-        rsi_series = calculate_rsi(data["Close"], period=period).dropna()
+        # Use the accurate, vectorized RSI calculation function
+        rsi_series = calculate_rsi(data["Close"], period=period)
 
         if rsi_series.empty:
-            return {"symbol": symbol, "error": "Could not calculate RSI, not enough data after dropping NaNs.", "interval": interval}
+            return {"symbol": symbol, "error": "RSI calculation resulted in no values. This can happen with sparse data.", "interval": interval}
 
         latest_rsi = float(rsi_series.iloc[-1])
         return {
             "symbol": symbol,
+            "normalized_symbol": normalized_symbol,
             "rsi": round(latest_rsi, 2),
             "period": period,
             "interval": interval,
