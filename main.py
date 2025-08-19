@@ -18,25 +18,28 @@ def rsi_wilder(series, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-@app.get("/")
-def home():
-    return {"status": "ok", "message": "RSI service running"}
-
 @app.get("/rsi")
-def get_rsi(symbol: str, period: int = 14):
+def get_rsi(symbol: str, period: int = 14, interval: str = "1d", lookback: str = "1y"):
     try:
-        # Fetch 1 year daily data, unadjusted
-        data = yf.download(symbol, period="1y", interval="1d", auto_adjust=False, progress=False)
+        # Fetch data with chosen interval & lookback
+        data = yf.download(symbol, period=lookback, interval=interval, auto_adjust=False, progress=False)
 
         if data.empty:
-            return {"symbol": symbol, "error": "no_data"}
+            return {"symbol": symbol, "error": "no_data", "interval": interval}
 
         rsi_series = rsi_wilder(data["Close"], period=period).dropna()
 
         if rsi_series.empty:
-            return {"symbol": symbol, "error": "insufficient_data"}
+            return {"symbol": symbol, "error": "insufficient_data", "interval": interval}
 
         latest_rsi = float(rsi_series.iloc[-1])
-        return {"symbol": symbol, "rsi": round(latest_rsi, 2), "period": period}
+        return {
+            "symbol": symbol,
+            "rsi": round(latest_rsi, 2),
+            "period": period,
+            "interval": interval
+        }
     except Exception as e:
-        return {"symbol": symbol, "error": str(e)}
+        return {"symbol": symbol, "error": str(e), "interval": interval}
+
+
